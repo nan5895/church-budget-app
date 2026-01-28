@@ -1,0 +1,7 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+demo.py
+setup_secrets.py
+SETUP_GUIDE.md
+.DS_Store
