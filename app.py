@@ -220,8 +220,8 @@ def get_budget_sheet():
     try:
         ws = spreadsheet.worksheet("Budget")
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title="Budget", rows=100, cols=5)
-        ws.append_row(["Category", "Monthly Budget", "Year", "Notes"])
+        ws = spreadsheet.add_worksheet(title="Budget", rows=100, cols=6)
+        ws.append_row(["Category", "Monthly Budget", "Year", "Month", "Notes"])
     return ws
 
 
@@ -402,32 +402,83 @@ def load_budgets() -> pd.DataFrame:
     ws = get_budget_sheet()
     data = ws.get_all_records()
     if not data:
-        return pd.DataFrame(columns=["Category", "Monthly Budget", "Year", "Notes"])
+        return pd.DataFrame(columns=["Category", "Monthly Budget", "Year", "Month", "Notes"])
     df = pd.DataFrame(data)
     df["Monthly Budget"] = pd.to_numeric(df["Monthly Budget"], errors="coerce").fillna(0)
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce").fillna(0).astype(int)
+    df["Month"] = pd.to_numeric(df["Month"], errors="coerce").fillna(0).astype(int)
     return df
+
+
+def get_budget_for_month(budgets: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
+    """Get budget for a specific month. Falls back to year-only budget (Month=0) if no monthly budget exists."""
+    if budgets.empty:
+        return budgets
+
+    # First, try to get budgets for specific year/month
+    monthly = budgets[(budgets["Year"] == year) & (budgets["Month"] == month)]
+
+    # If no monthly budget, fall back to yearly budget (Month = 0 means all months)
+    if monthly.empty:
+        monthly = budgets[(budgets["Year"] == year) & (budgets["Month"] == 0)]
+
+    # If still empty, try just the year
+    if monthly.empty:
+        monthly = budgets[budgets["Year"] == year]
+
+    return monthly
 
 
 # ──────────────────────────────────────────────
 # Excel Export
 # ──────────────────────────────────────────────
-def generate_excel_report(df: pd.DataFrame) -> bytes:
+def generate_excel_report(df: pd.DataFrame, budgets: pd.DataFrame = None) -> bytes:
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
     output = io.BytesIO()
+    now = datetime.datetime.now()
+    current_year = now.year
+    current_month = now.month
+
+    # Pre-calculate budget by category for this year
+    budget_by_cat = {}
+    if budgets is not None and not budgets.empty:
+        for m in range(1, current_month + 1):
+            month_budgets = get_budget_for_month(budgets, current_year, m)
+            for _, row in month_budgets.iterrows():
+                cat = row["Category"]
+                budget_by_cat[cat] = budget_by_cat.get(cat, 0) + row["Monthly Budget"]
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # ── Sheet 1: Transactions (지출 내역) ──
         export_df = df.copy()
         if "Date" in export_df.columns:
             export_df["Date"] = export_df["Date"].astype(str)
-        export_df.to_excel(writer, index=False, sheet_name="Transactions")
+
+        # Add Korean column names
+        col_mapping = {
+            "Date": "날짜",
+            "Category": "카테고리",
+            "Description": "설명",
+            "Amount": "금액",
+            "Payment Method": "결제수단",
+            "Receipt URL": "영수증 URL",
+            "OCR Amount": "OCR 인식금액",
+            "Submitted By": "입력자",
+            "Timestamp": "등록시간"
+        }
+        export_df = export_df.rename(columns=col_mapping)
+        export_df.to_excel(writer, index=False, sheet_name="지출내역")
 
         # Add hyperlinks for receipt URLs
-        ws = writer.sheets["Transactions"]
+        ws = writer.sheets["지출내역"]
         url_col = None
         for idx, col in enumerate(export_df.columns, 1):
-            if col == "Receipt URL":
+            if col == "영수증 URL":
                 url_col = idx
                 break
         if url_col:
-            from openpyxl.utils import get_column_letter
             col_letter = get_column_letter(url_col)
             for row_idx in range(2, len(export_df) + 2):
                 cell = ws[f"{col_letter}{row_idx}"]
@@ -435,11 +486,92 @@ def generate_excel_report(df: pd.DataFrame) -> bytes:
                     cell.hyperlink = str(cell.value)
                     cell.style = "Hyperlink"
 
-        # Summary sheet
+        # ── Sheet 2: Budget Settings (예산 설정) ──
+        if budgets is not None and not budgets.empty:
+            budget_df = budgets.copy()
+            month_names = {0: "전체(연간)", 1: "1월", 2: "2월", 3: "3월", 4: "4월", 5: "5월",
+                          6: "6월", 7: "7월", 8: "8월", 9: "9월", 10: "10월", 11: "11월", 12: "12월"}
+            budget_df["Month"] = budget_df["Month"].apply(lambda x: month_names.get(x, str(x)))
+            budget_df = budget_df.rename(columns={
+                "Category": "카테고리",
+                "Monthly Budget": "예산금액",
+                "Year": "연도",
+                "Month": "월",
+                "Notes": "메모"
+            })
+            budget_df.to_excel(writer, index=False, sheet_name="예산설정")
+
+        # ── Sheet 3: Category Summary (카테고리별 요약) ──
         if not df.empty and "Category" in df.columns and "Amount" in df.columns:
-            summary = df.groupby("Category")["Amount"].agg(["sum", "count", "mean"]).reset_index()
-            summary.columns = ["Category", "Total", "Count", "Average"]
-            summary.to_excel(writer, index=False, sheet_name="Summary")
+            summary = df.groupby("Category").agg({
+                "Amount": ["sum", "count", "mean", "min", "max"]
+            }).reset_index()
+            summary.columns = ["카테고리", "총지출", "건수", "평균", "최소", "최대"]
+            summary["총지출"] = summary["총지출"].apply(lambda x: round(x, 0))
+            summary["평균"] = summary["평균"].apply(lambda x: round(x, 0))
+            summary.to_excel(writer, index=False, sheet_name="카테고리별요약")
+
+        # ── Sheet 4: Budget vs Actual (예산대비실적) ──
+        if budget_by_cat and not df.empty:
+            # This year's spending per category
+            this_year_df = df[pd.to_datetime(df["Date"], errors="coerce").dt.year == current_year] if "Date" in df.columns else df
+            cat_spent = this_year_df.groupby("Category")["Amount"].sum().reset_index() if not this_year_df.empty else pd.DataFrame(columns=["Category", "Amount"])
+
+            comparison = pd.DataFrame(list(budget_by_cat.items()), columns=["카테고리", "누적예산"])
+            comparison = comparison.merge(cat_spent.rename(columns={"Category": "카테고리", "Amount": "실제지출"}), on="카테고리", how="left").fillna(0)
+            comparison["잔여예산"] = comparison["누적예산"] - comparison["실제지출"]
+            comparison["집행률(%)"] = (comparison["실제지출"] / comparison["누적예산"] * 100).round(1)
+            comparison["집행률(%)"] = comparison["집행률(%)"].replace([float('inf'), -float('inf')], 0).fillna(0)
+            comparison["상태"] = comparison["잔여예산"].apply(lambda x: "✅ 정상" if x >= 0 else "⚠️ 초과")
+            comparison.to_excel(writer, index=False, sheet_name="예산대비실적")
+
+        # ── Sheet 5: Monthly Trend (월별추이) ──
+        if not df.empty and "Date" in df.columns:
+            df_copy = df.copy()
+            df_copy["Date"] = pd.to_datetime(df_copy["Date"], errors="coerce")
+            df_copy = df_copy.dropna(subset=["Date"])
+            if not df_copy.empty:
+                df_copy["연월"] = df_copy["Date"].dt.to_period("M").astype(str)
+                monthly_trend = df_copy.groupby("연월").agg({
+                    "Amount": ["sum", "count", "mean"]
+                }).reset_index()
+                monthly_trend.columns = ["연월", "총지출", "건수", "평균지출"]
+                monthly_trend["총지출"] = monthly_trend["총지출"].apply(lambda x: round(x, 0))
+                monthly_trend["평균지출"] = monthly_trend["평균지출"].apply(lambda x: round(x, 0))
+                monthly_trend.to_excel(writer, index=False, sheet_name="월별추이")
+
+        # ── Sheet 6: Payment Method Summary (결제수단별) ──
+        if not df.empty and "Payment Method" in df.columns:
+            payment_summary = df.groupby("Payment Method").agg({
+                "Amount": ["sum", "count"]
+            }).reset_index()
+            payment_summary.columns = ["결제수단", "총금액", "건수"]
+            payment_summary["비율(%)"] = (payment_summary["총금액"] / payment_summary["총금액"].sum() * 100).round(1)
+            payment_summary.to_excel(writer, index=False, sheet_name="결제수단별")
+
+        # ── Sheet 7: Report Summary (리포트요약) ──
+        total_spent = df["Amount"].sum() if not df.empty else 0
+        total_budget = sum(budget_by_cat.values()) if budget_by_cat else 0
+
+        report_summary = pd.DataFrame({
+            "항목": [
+                "리포트 생성일",
+                "총 거래 건수",
+                "총 지출 금액",
+                f"{current_year}년 누적 예산",
+                "잔여 예산",
+                "전체 집행률(%)"
+            ],
+            "값": [
+                now.strftime("%Y-%m-%d %H:%M"),
+                f"{len(df)}건",
+                f"₩{total_spent:,.0f}",
+                f"₩{total_budget:,.0f}",
+                f"₩{total_budget - total_spent:,.0f}",
+                f"{(total_spent / total_budget * 100):.1f}%" if total_budget > 0 else "N/A"
+            ]
+        })
+        report_summary.to_excel(writer, index=False, sheet_name="리포트요약")
 
     return output.getvalue()
 
@@ -492,11 +624,15 @@ if page == "📊 대시보드":
     current_month = now.month
     current_year = now.year
 
-    monthly_budget = budgets["Monthly Budget"].sum() if not budgets.empty else 0
+    # Get budget for current month (from settings)
+    current_month_budgets = get_budget_for_month(budgets, current_year, current_month)
+    monthly_budget = current_month_budgets["Monthly Budget"].sum() if not current_month_budgets.empty else 0
 
-    # 총예산 = 이번달 예산 + 이월 잔액 (unspent budget from previous months this year)
-    months_elapsed = current_month  # including current month
-    cumulative_budget = monthly_budget * months_elapsed
+    # Calculate cumulative budget for the year (sum of each month's budget)
+    cumulative_budget = 0
+    for m in range(1, current_month + 1):
+        month_budget = get_budget_for_month(budgets, current_year, m)
+        cumulative_budget += month_budget["Monthly Budget"].sum() if not month_budget.empty else 0
 
     if not df.empty and "Date" in df.columns:
         # This month's spending
@@ -506,7 +642,7 @@ if page == "📊 대시보드":
         # Total spending (all time)
         total_spent = df["Amount"].sum()
 
-        # Previous months spent this year (for carryover calc)
+        # This year's spending (for carryover calc)
         this_year_mask = df["Date"].dt.year == current_year
         total_spent_this_year = df.loc[this_year_mask, "Amount"].sum()
 
@@ -517,7 +653,7 @@ if page == "📊 대시보드":
         total_spent_this_year = 0
         tx_count = 0
 
-    # 총예산 = 올해 누적 예산 (이번달 예산 + 이월된 예산)
+    # 총예산 = 올해 누적 예산 (1월~이번달까지의 예산 합계)
     total_budget = cumulative_budget
     remaining = total_budget - total_spent_this_year
 
@@ -567,10 +703,21 @@ if page == "📊 대시보드":
 
         with col_right:
             st.markdown('<p class="section-title">예산 대비 지출 현황</p>', unsafe_allow_html=True)
-            if not budgets.empty:
-                cat_spent = df.groupby("Category")["Amount"].sum().reset_index()
-                comparison = budgets.merge(cat_spent, on="Category", how="left").fillna(0)
-                comparison["Budget"] = comparison["Monthly Budget"] * months_elapsed
+            if not current_month_budgets.empty:
+                # Calculate this year's spending per category
+                this_year_df = df[df["Date"].dt.year == current_year] if not df.empty else df
+                cat_spent = this_year_df.groupby("Category")["Amount"].sum().reset_index() if not this_year_df.empty else pd.DataFrame(columns=["Category", "Amount"])
+
+                # Calculate cumulative budget per category
+                budget_by_cat = {}
+                for m in range(1, current_month + 1):
+                    month_budgets = get_budget_for_month(budgets, current_year, m)
+                    for _, row in month_budgets.iterrows():
+                        cat = row["Category"]
+                        budget_by_cat[cat] = budget_by_cat.get(cat, 0) + row["Monthly Budget"]
+
+                comparison = pd.DataFrame(list(budget_by_cat.items()), columns=["Category", "Budget"])
+                comparison = comparison.merge(cat_spent, on="Category", how="left").fillna(0)
                 comparison["Spent"] = comparison["Amount"]
                 comparison["Remaining"] = (comparison["Budget"] - comparison["Spent"]).clip(lower=0)
                 comparison["Over"] = (comparison["Spent"] - comparison["Budget"]).clip(lower=0)
@@ -786,41 +933,52 @@ elif page == "📋 거래 내역":
 # ──────────────────────────────────────────────
 elif page == "⚙️ 예산 설정":
     st.markdown('<p class="main-header">예산 설정</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">카테고리별 월 예산을 설정합니다</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">카테고리별 월/연간 예산을 설정합니다</p>', unsafe_allow_html=True)
 
     budgets = load_budgets()
+    month_names = {0: "전체 (연간)", 1: "1월", 2: "2월", 3: "3월", 4: "4월", 5: "5월",
+                   6: "6월", 7: "7월", 8: "8월", 9: "9월", 10: "10월", 11: "11월", 12: "12월"}
 
     if not budgets.empty:
         st.markdown('<p class="section-title">현재 예산</p>', unsafe_allow_html=True)
         display_b = budgets.copy()
         display_b["Monthly Budget"] = display_b["Monthly Budget"].apply(lambda x: f"₩{x:,.0f}")
-        st.dataframe(display_b, width="stretch", hide_index=True)
+        display_b["Month"] = display_b["Month"].apply(lambda x: month_names.get(x, str(x)))
+        display_b = display_b.rename(columns={"Monthly Budget": "예산", "Year": "연도", "Month": "월", "Category": "카테고리", "Notes": "메모"})
+        st.dataframe(display_b[["카테고리", "예산", "연도", "월", "메모"]], width="stretch", hide_index=True)
 
         # ── Edit existing budget ──
         st.markdown('<p class="section-title">예산 수정</p>', unsafe_allow_html=True)
         edit_idx = st.selectbox(
             "수정할 항목 선택",
             range(len(budgets)),
-            format_func=lambda i: budgets.iloc[i]["Category"],
+            format_func=lambda i: f"{budgets.iloc[i]['Category']} ({budgets.iloc[i]['Year']}년 {month_names.get(budgets.iloc[i]['Month'], '')})",
             key="edit_select",
         )
         sel = budgets.iloc[edit_idx]
         with st.form("edit_budget_form"):
-            ec1, ec2, ec3 = st.columns(3)
+            ec1, ec2 = st.columns(2)
             with ec1:
                 edit_cat = st.text_input("카테고리", value=sel["Category"])
+                edit_budget = st.number_input("예산 (원)", value=int(sel["Monthly Budget"]), min_value=0, step=10000)
             with ec2:
-                edit_budget = st.number_input("월 예산 (원)", value=int(sel["Monthly Budget"]), min_value=0, step=10000)
-            with ec3:
-                edit_year = st.text_input("연도", value=str(sel.get("Year", str(datetime.date.today().year))))
+                edit_year = st.number_input("연도", value=int(sel.get("Year", datetime.date.today().year)), min_value=2020, max_value=2100)
+                edit_month = st.selectbox(
+                    "월 (0=연간 전체)",
+                    options=list(month_names.keys()),
+                    format_func=lambda x: month_names[x],
+                    index=list(month_names.keys()).index(int(sel.get("Month", 0)))
+                )
             edit_notes = st.text_input("메모", value=str(sel.get("Notes", "")))
+
+            st.info("💡 월=0(전체)으로 설정하면 해당 연도 모든 달에 적용됩니다. 특정 월에 별도 예산을 설정하면 그 달은 별도 예산이 우선 적용됩니다.")
 
             fc1, fc2 = st.columns(2)
             with fc1:
                 if st.form_submit_button("💾 수정 저장", width="stretch"):
                     ws = get_budget_sheet()
                     sheet_row = edit_idx + 2
-                    ws.update(f"A{sheet_row}:D{sheet_row}", [[edit_cat, edit_budget, edit_year, edit_notes]])
+                    ws.update(f"A{sheet_row}:E{sheet_row}", [[edit_cat, edit_budget, edit_year, edit_month, edit_notes]])
                     st.cache_data.clear()
                     st.success(f"✅ '{edit_cat}' 예산이 수정되었습니다.")
                     st.rerun()
@@ -836,22 +994,30 @@ elif page == "⚙️ 예산 설정":
     st.markdown('<p class="section-title">예산 추가</p>', unsafe_allow_html=True)
 
     with st.form("budget_form"):
-        bc1, bc2, bc3 = st.columns(3)
+        bc1, bc2 = st.columns(2)
         with bc1:
             new_cat = st.text_input("카테고리명", placeholder="예: 악기/장비")
+            new_budget = st.number_input("예산 (원)", min_value=0, step=10000)
         with bc2:
-            new_budget = st.number_input("월 예산 (원)", min_value=0, step=10000)
-        with bc3:
-            new_year = st.text_input("연도", value=str(datetime.date.today().year))
+            new_year = st.number_input("연도", value=datetime.date.today().year, min_value=2020, max_value=2100)
+            new_month = st.selectbox(
+                "월",
+                options=list(month_names.keys()),
+                format_func=lambda x: month_names[x],
+                index=0,  # default to "전체 (연간)"
+                key="new_month_select"
+            )
 
         notes = st.text_input("메모", placeholder="선택사항")
+
+        st.info("💡 월=0(전체)으로 설정하면 해당 연도 모든 달에 동일한 예산이 적용됩니다.")
 
         if st.form_submit_button("➕ 예산 추가", width="stretch"):
             if new_cat and new_budget > 0:
                 ws = get_budget_sheet()
-                ws.append_row([new_cat, new_budget, new_year, notes])
+                ws.append_row([new_cat, new_budget, new_year, new_month, notes])
                 st.cache_data.clear()
-                st.success(f"✅ '{new_cat}' 예산이 추가되었습니다.")
+                st.success(f"✅ '{new_cat}' 예산이 추가되었습니다 ({new_year}년 {month_names[new_month]})")
                 st.rerun()
             else:
                 st.error("카테고리명과 예산 금액을 입력해주세요.")
@@ -862,24 +1028,92 @@ elif page == "⚙️ 예산 설정":
 # ──────────────────────────────────────────────
 elif page == "📥 리포트 다운로드":
     st.markdown('<p class="main-header">리포트 다운로드</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Excel 형식의 상세 리포트를 다운로드합니다</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">예산 및 지출 현황을 포함한 상세 리포트를 다운로드합니다</p>', unsafe_allow_html=True)
 
     df = load_transactions()
+    budgets = load_budgets()
 
-    if df.empty:
-        st.info("다운로드할 거래 데이터가 없습니다.")
+    now = datetime.datetime.now()
+    current_year = now.year
+    current_month = now.month
+
+    # Report Overview
+    st.markdown('<p class="section-title">리포트 개요</p>', unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        total_tx = len(df) if not df.empty else 0
+        metric_card("총 거래 건수", f"{total_tx}건", "primary")
+
+    with col2:
+        total_spent = df["Amount"].sum() if not df.empty else 0
+        metric_card("총 지출 금액", f"₩{total_spent:,.0f}", "warning")
+
+    with col3:
+        # Calculate cumulative budget
+        cumulative_budget = 0
+        for m in range(1, current_month + 1):
+            month_budget = get_budget_for_month(budgets, current_year, m)
+            cumulative_budget += month_budget["Monthly Budget"].sum() if not month_budget.empty else 0
+        remaining = cumulative_budget - total_spent
+        metric_card("잔여 예산", f"₩{remaining:,.0f}", "success" if remaining >= 0 else "danger")
+
+    st.markdown("")
+
+    # Category Summary
+    if not df.empty and "Category" in df.columns:
+        st.markdown('<p class="section-title">카테고리별 지출 요약</p>', unsafe_allow_html=True)
+        summary = df.groupby("Category")["Amount"].agg(["sum", "count", "mean"]).reset_index()
+        summary.columns = ["카테고리", "총액", "건수", "평균"]
+        summary["총액"] = summary["총액"].apply(lambda x: f"₩{x:,.0f}")
+        summary["평균"] = summary["평균"].apply(lambda x: f"₩{x:,.0f}")
+        st.dataframe(summary, width="stretch", hide_index=True)
+
+    # Budget vs Actual Preview
+    if not budgets.empty:
+        st.markdown('<p class="section-title">예산 대비 실적 요약</p>', unsafe_allow_html=True)
+
+        budget_by_cat = {}
+        for m in range(1, current_month + 1):
+            month_budgets = get_budget_for_month(budgets, current_year, m)
+            for _, row in month_budgets.iterrows():
+                cat = row["Category"]
+                budget_by_cat[cat] = budget_by_cat.get(cat, 0) + row["Monthly Budget"]
+
+        if not df.empty:
+            cat_spent = df.groupby("Category")["Amount"].sum().reset_index()
+            comparison = pd.DataFrame(list(budget_by_cat.items()), columns=["카테고리", "누적예산"])
+            comparison = comparison.merge(cat_spent.rename(columns={"Category": "카테고리", "Amount": "지출"}), on="카테고리", how="left").fillna(0)
+            comparison["잔여"] = comparison["누적예산"] - comparison["지출"]
+            comparison["집행률"] = (comparison["지출"] / comparison["누적예산"] * 100).round(1)
+            comparison["집행률"] = comparison["집행률"].replace([float('inf'), -float('inf')], 0).fillna(0)
+            comparison["집행률"] = comparison["집행률"].apply(lambda x: f"{x:.1f}%")
+            comparison["누적예산"] = comparison["누적예산"].apply(lambda x: f"₩{x:,.0f}")
+            comparison["지출"] = comparison["지출"].apply(lambda x: f"₩{x:,.0f}")
+            comparison["잔여"] = comparison["잔여"].apply(lambda x: f"₩{x:,.0f}")
+            st.dataframe(comparison, width="stretch", hide_index=True)
+
+    # Report Contents Info
+    st.markdown('<p class="section-title">리포트 포함 내용</p>', unsafe_allow_html=True)
+    st.markdown("""
+    다운로드되는 Excel 파일에는 다음 시트가 포함됩니다:
+
+    1. **지출내역** - 전체 거래 목록 (날짜, 카테고리, 설명, 금액, 결제수단 등)
+    2. **예산설정** - 설정된 예산 목록 (카테고리별 연간/월간 예산)
+    3. **카테고리별요약** - 카테고리별 총지출, 건수, 평균, 최소, 최대
+    4. **예산대비실적** - 예산 대비 실제 지출 현황 및 집행률
+    5. **월별추이** - 월별 지출 추이
+    6. **결제수단별** - 결제수단별 지출 현황
+    7. **리포트요약** - 주요 지표 요약
+    """)
+
+    st.markdown("")
+
+    if df.empty and budgets.empty:
+        st.info("다운로드할 데이터가 없습니다. 먼저 예산 설정 또는 지출을 입력해주세요.")
     else:
-        st.markdown(f"총 **{len(df)}건**의 거래 데이터가 포함됩니다.")
-
-        # Summary preview
-        if "Category" in df.columns:
-            st.markdown('<p class="section-title">카테고리별 요약</p>', unsafe_allow_html=True)
-            summary = df.groupby("Category")["Amount"].agg(["sum", "count"]).reset_index()
-            summary.columns = ["카테고리", "총액", "건수"]
-            summary["총액"] = summary["총액"].apply(lambda x: f"₩{x:,.0f}")
-            st.dataframe(summary, width="stretch", hide_index=True)
-
-        excel_data = generate_excel_report(df)
+        excel_data = generate_excel_report(df, budgets)
         today = datetime.date.today().strftime("%Y%m%d")
 
         st.download_button(
