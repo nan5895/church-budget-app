@@ -418,18 +418,14 @@ def load_budgets() -> pd.DataFrame:
 
 
 def get_budget_for_month(budgets: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
-    """Get budget for a specific month. Falls back to year-only budget (Month=0) if no monthly budget exists."""
+    """Get budget for a specific month. Only returns exact matches - no fallback."""
     if budgets.empty:
         return budgets
 
-    # First, try to get budgets for specific year/month
+    # ONLY return budgets explicitly set for this specific year/month
+    # No fallback to Month=0 or any other month
     monthly = budgets[(budgets["Year"] == year) & (budgets["Month"] == month)]
 
-    # If no monthly budget, fall back to yearly budget (Month = 0 means all months)
-    if monthly.empty:
-        monthly = budgets[(budgets["Year"] == year) & (budgets["Month"] == 0)]
-
-    # Return empty if no budget is set for this month (don't fallback to random year data)
     return monthly
 
 
@@ -1021,13 +1017,16 @@ elif page == "📋 거래 내역":
 # ──────────────────────────────────────────────
 elif page == "⚙️ 예산 설정":
     st.markdown('<p class="main-header">예산 설정</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">카테고리별 월/연간 예산을 설정합니다</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">카테고리별 월 예산을 설정합니다 (각 월별로 설정 필요)</p>', unsafe_allow_html=True)
 
     # Force fresh data
     st.cache_data.clear()
     budgets = load_budgets()
-    month_names = {0: "전체 (연간)", 1: "1월", 2: "2월", 3: "3월", 4: "4월", 5: "5월",
+    # Month 1-12 only (no Month=0 "annual" option - each month must be set explicitly)
+    month_names = {1: "1월", 2: "2월", 3: "3월", 4: "4월", 5: "5월",
                    6: "6월", 7: "7월", 8: "8월", 9: "9월", 10: "10월", 11: "11월", 12: "12월"}
+    # For display of old data with Month=0
+    month_names_display = {0: "⚠️ 미지정", **month_names}
 
     now = datetime.datetime.now()
     current_year = now.year
@@ -1080,7 +1079,7 @@ elif page == "⚙️ 예산 설정":
             years_in_data = sorted(budgets["Year"].unique().tolist(), reverse=True)
             filter_year = st.selectbox("연도 필터", ["전체"] + years_in_data, key="budget_filter_year")
         with filter_col2:
-            filter_month = st.selectbox("월 필터", ["전체"] + list(month_names.keys()), format_func=lambda x: "전체" if x == "전체" else month_names[x], key="budget_filter_month")
+            filter_month = st.selectbox("월 필터", ["전체"] + list(month_names.keys()), format_func=lambda x: "전체" if x == "전체" else month_names.get(x, str(x)), key="budget_filter_month")
         with filter_col3:
             cats_in_data = sorted(budgets["Category"].unique().tolist())
             filter_cat = st.selectbox("카테고리 필터", ["전체"] + cats_in_data, key="budget_filter_cat")
@@ -1097,10 +1096,15 @@ elif page == "⚙️ 예산 설정":
         if not filtered_budgets.empty:
             display_b = filtered_budgets.copy()
             display_b["Monthly Budget"] = display_b["Monthly Budget"].apply(lambda x: f"₩{x:,.0f}")
-            display_b["Month"] = display_b["Month"].apply(lambda x: month_names.get(x, str(x)))
+            display_b["Month"] = display_b["Month"].apply(lambda x: month_names_display.get(x, str(x)))
             display_b = display_b.rename(columns={"Monthly Budget": "예산", "Year": "연도", "Month": "월", "Category": "카테고리", "Notes": "메모"})
             st.dataframe(display_b[["카테고리", "예산", "연도", "월", "메모"]], width="stretch", hide_index=True)
             st.caption(f"총 {len(filtered_budgets)}건")
+
+            # Warning for Month=0 entries
+            old_entries = filtered_budgets[filtered_budgets["Month"] == 0]
+            if not old_entries.empty:
+                st.warning(f"⚠️ '미지정(월=0)' 항목이 {len(old_entries)}건 있습니다. 이 항목들은 예산에 반영되지 않습니다. 아래 '예산 수정'에서 올바른 월(1-12)로 수정해주세요.")
         else:
             st.info("필터 조건에 맞는 예산이 없습니다.")
 
@@ -1111,10 +1115,16 @@ elif page == "⚙️ 예산 설정":
         edit_idx = st.selectbox(
             "수정할 항목 선택",
             range(len(budgets)),
-            format_func=lambda i: f"{budgets.iloc[i]['Category']} ({budgets.iloc[i]['Year']}년 {month_names.get(budgets.iloc[i]['Month'], '')})",
+            format_func=lambda i: f"{budgets.iloc[i]['Category']} ({budgets.iloc[i]['Year']}년 {month_names_display.get(budgets.iloc[i]['Month'], '?')})",
             key="edit_select",
         )
         sel = budgets.iloc[edit_idx]
+
+        # Check if current entry has Month=0 (needs fixing)
+        current_month_val = int(sel.get("Month", 0))
+        if current_month_val == 0:
+            st.error(f"⚠️ 이 항목은 월이 '미지정(0)'입니다. 아래에서 올바른 월(1-12)을 선택해주세요.")
+
         with st.form("edit_budget_form"):
             ec1, ec2 = st.columns(2)
             with ec1:
@@ -1122,15 +1132,19 @@ elif page == "⚙️ 예산 설정":
                 edit_budget = st.number_input("예산 (원)", value=int(sel["Monthly Budget"]), min_value=0, step=10000)
             with ec2:
                 edit_year = st.number_input("연도", value=int(sel.get("Year", datetime.date.today().year)), min_value=2020, max_value=2100)
+                # Only allow months 1-12
+                month_options = list(month_names.keys())  # [1, 2, ..., 12]
+                # If current month is 0, default to current month
+                default_month = current_month_val if current_month_val in month_options else current_month
                 edit_month = st.selectbox(
-                    "월 (0=연간 전체)",
-                    options=list(month_names.keys()),
+                    "월 (1-12월 선택)",
+                    options=month_options,
                     format_func=lambda x: month_names[x],
-                    index=list(month_names.keys()).index(int(sel.get("Month", 0)))
+                    index=month_options.index(default_month)
                 )
             edit_notes = st.text_input("메모", value=str(sel.get("Notes", "")))
 
-            st.info("💡 월=0(전체)으로 설정하면 해당 연도 모든 달에 적용됩니다. 특정 월에 별도 예산을 설정하면 그 달은 별도 예산이 우선 적용됩니다.")
+            st.info("💡 각 월의 예산은 해당 월에만 적용됩니다. 여러 달에 같은 예산을 적용하려면 각 월별로 추가해주세요.")
 
             fc1, fc2 = st.columns(2)
             with fc1:
@@ -1159,17 +1173,18 @@ elif page == "⚙️ 예산 설정":
             new_budget = st.number_input("예산 (원)", min_value=0, step=10000)
         with bc2:
             new_year = st.number_input("연도", value=datetime.date.today().year, min_value=2020, max_value=2100)
+            add_month_options = list(month_names.keys())  # [1, 2, ..., 12]
             new_month = st.selectbox(
-                "월",
-                options=list(month_names.keys()),
+                "월 (1-12월 선택)",
+                options=add_month_options,
                 format_func=lambda x: month_names[x],
-                index=current_month,  # default to current month
+                index=add_month_options.index(current_month),  # default to current month
                 key="new_month_select"
             )
 
         notes = st.text_input("메모", placeholder="선택사항")
 
-        st.info("💡 월=0(전체)으로 설정하면 해당 연도 모든 달에 동일한 예산이 적용됩니다. 특정 월만 설정하면 그 달에만 적용됩니다.")
+        st.info("💡 각 월의 예산은 해당 월에만 적용됩니다. 여러 달에 같은 예산이 필요하면 각 월별로 추가해주세요.")
 
         if st.form_submit_button("➕ 예산 추가", use_container_width=True):
             if new_cat and new_budget > 0:
