@@ -882,25 +882,13 @@ elif page == "📤 지출 입력":
     # Input Form
     st.markdown('<p class="section-title">📝 거래 정보</p>', unsafe_allow_html=True)
 
-    # Category selection (outside form for dynamic behavior)
-    cat_col1, cat_col2 = st.columns([2, 1])
-    with cat_col1:
-        selected_category = st.selectbox("카테고리 선택", category_options, key="cat_select")
-    with cat_col2:
-        if selected_category == "➕ 직접 입력":
-            custom_category = st.text_input("새 카테고리 입력", placeholder="예: 의상/유니폼", key="custom_cat")
-        else:
-            custom_category = ""
-
-    # Determine final category
-    final_category = custom_category if selected_category == "➕ 직접 입력" else selected_category
-
     with st.form("expense_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
 
         with col1:
             date = st.date_input("날짜", value=datetime.date.today())
-            st.text_input("선택된 카테고리", value=final_category, disabled=True, key="display_cat")
+            selected_category = st.selectbox("카테고리 선택", all_categories)
+            custom_category = st.text_input("또는 직접 입력", placeholder="새 카테고리명 입력 (선택사항)")
             description = st.text_input("설명", placeholder="예: 건반 수리비")
 
         with col2:
@@ -915,13 +903,15 @@ elif page == "📤 지출 입력":
             payment_method = st.selectbox("결제 수단", ["카드", "현금", "계좌이체", "기타"])
             submitted_by = st.text_input("입력자", placeholder="이름")
 
+        st.caption("💡 직접 입력란에 값이 있으면 해당 값이 카테고리로 사용됩니다.")
+
         submitted = st.form_submit_button("💾 저장하기", use_container_width=True)
 
         if submitted:
-            # Use the final_category determined above
-            category = final_category
+            # Use custom category if provided, otherwise use selected
+            category = custom_category.strip() if custom_category.strip() else selected_category
 
-            if not category or category == "➕ 직접 입력":
+            if not category:
                 st.error("카테고리를 선택하거나 입력해주세요.")
             elif amount <= 0:
                 st.error("금액을 입력해주세요.")
