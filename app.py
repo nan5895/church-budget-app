@@ -823,10 +823,24 @@ elif page == "📤 지출 입력":
     st.markdown('<p class="main-header">지출 입력</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">영수증을 업로드하면 금액이 자동 인식됩니다</p>', unsafe_allow_html=True)
 
+    # Get categories from multiple sources
     budgets = load_budgets()
-    categories = budgets["Category"].tolist() if not budgets.empty else [
-        "악기/장비", "음향장비", "악보/교재", "식비/간식", "교통비", "기타"
-    ]
+    transactions = load_transactions()
+
+    # 1. Categories from budget settings
+    budget_categories = budgets["Category"].unique().tolist() if not budgets.empty else []
+
+    # 2. Categories from existing transactions
+    transaction_categories = transactions["Category"].unique().tolist() if not transactions.empty and "Category" in transactions.columns else []
+
+    # 3. Default categories
+    default_categories = ["악기/장비", "음향장비", "악보/교재", "식비/간식", "교통비", "기타"]
+
+    # Combine all and remove duplicates, then sort
+    all_categories = sorted(list(set(budget_categories + transaction_categories + default_categories)))
+
+    # Add "직접 입력" option at the end
+    category_options = all_categories + ["➕ 직접 입력"]
 
     # Receipt Upload Section
     st.markdown('<p class="section-title">📸 영수증 업로드 (선택)</p>', unsafe_allow_html=True)
@@ -868,12 +882,25 @@ elif page == "📤 지출 입력":
     # Input Form
     st.markdown('<p class="section-title">📝 거래 정보</p>', unsafe_allow_html=True)
 
+    # Category selection (outside form for dynamic behavior)
+    cat_col1, cat_col2 = st.columns([2, 1])
+    with cat_col1:
+        selected_category = st.selectbox("카테고리 선택", category_options, key="cat_select")
+    with cat_col2:
+        if selected_category == "➕ 직접 입력":
+            custom_category = st.text_input("새 카테고리 입력", placeholder="예: 의상/유니폼", key="custom_cat")
+        else:
+            custom_category = ""
+
+    # Determine final category
+    final_category = custom_category if selected_category == "➕ 직접 입력" else selected_category
+
     with st.form("expense_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
 
         with col1:
             date = st.date_input("날짜", value=datetime.date.today())
-            category = st.selectbox("카테고리", categories)
+            st.text_input("선택된 카테고리", value=final_category, disabled=True, key="display_cat")
             description = st.text_input("설명", placeholder="예: 건반 수리비")
 
         with col2:
@@ -888,10 +915,15 @@ elif page == "📤 지출 입력":
             payment_method = st.selectbox("결제 수단", ["카드", "현금", "계좌이체", "기타"])
             submitted_by = st.text_input("입력자", placeholder="이름")
 
-        submitted = st.form_submit_button("💾 저장하기", width="stretch")
+        submitted = st.form_submit_button("💾 저장하기", use_container_width=True)
 
         if submitted:
-            if amount <= 0:
+            # Use the final_category determined above
+            category = final_category
+
+            if not category or category == "➕ 직접 입력":
+                st.error("카테고리를 선택하거나 입력해주세요.")
+            elif amount <= 0:
                 st.error("금액을 입력해주세요.")
             elif not description:
                 st.error("설명을 입력해주세요.")
