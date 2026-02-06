@@ -620,6 +620,8 @@ if page == "📊 대시보드":
     st.markdown('<p class="main-header">Budget Dashboard</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">찬양팀 예산 현황을 한눈에 확인하세요</p>', unsafe_allow_html=True)
 
+    # Force fresh data load (no cache for dashboard)
+    st.cache_data.clear()
     df = load_transactions()
     budgets = load_budgets()
 
@@ -632,51 +634,62 @@ if page == "📊 대시보드":
     current_month_budgets = get_budget_for_month(budgets, current_year, current_month)
     monthly_budget = current_month_budgets["Monthly Budget"].sum() if not current_month_budgets.empty else 0
 
-    # Calculate cumulative budget for the year (sum of each month's budget)
-    cumulative_budget = 0
-    for m in range(1, current_month + 1):
+    # Calculate previous months' budget (1월 ~ 지난달)
+    prev_months_budget = 0
+    for m in range(1, current_month):  # 1월부터 지난달까지
         month_budget = get_budget_for_month(budgets, current_year, m)
-        cumulative_budget += month_budget["Monthly Budget"].sum() if not month_budget.empty else 0
+        prev_months_budget += month_budget["Monthly Budget"].sum() if not month_budget.empty else 0
 
     if not df.empty and "Date" in df.columns:
         # This month's spending
         this_month_mask = (df["Date"].dt.month == current_month) & (df["Date"].dt.year == current_year)
         this_month_spent = df.loc[this_month_mask, "Amount"].sum()
 
-        # Total spending (all time)
-        total_spent = df["Amount"].sum()
+        # Previous months' spending this year (1월 ~ 지난달)
+        prev_months_mask = (df["Date"].dt.month < current_month) & (df["Date"].dt.year == current_year)
+        prev_months_spent = df.loc[prev_months_mask, "Amount"].sum()
 
-        # This year's spending (for carryover calc)
+        # This year's spending
         this_year_mask = df["Date"].dt.year == current_year
         total_spent_this_year = df.loc[this_year_mask, "Amount"].sum()
 
         tx_count = len(df)
     else:
         this_month_spent = 0
-        total_spent = 0
+        prev_months_spent = 0
         total_spent_this_year = 0
         tx_count = 0
 
-    # 총예산 = 올해 누적 예산 (1월~이번달까지의 예산 합계)
-    total_budget = cumulative_budget
-    remaining = total_budget - total_spent_this_year
+    # 이월 잔액 = 이전 달들의 예산 합계 - 이전 달들의 지출 합계
+    carryover = prev_months_budget - prev_months_spent
+
+    # 이번달 사용가능 예산 = 이번달 예산 + 이월 잔액
+    available_budget = monthly_budget + carryover
+
+    # 잔여 예산 = 이번달 사용가능 예산 - 이번달 지출
+    remaining = available_budget - this_month_spent
 
     # KPI Cards — 6 metrics
     c1, c2, c3 = st.columns(3)
     with c1:
         metric_card("이번달 예산", f"₩{monthly_budget:,.0f}", "primary")
     with c2:
-        metric_card("총예산 (이번달+이월)", f"₩{total_budget:,.0f}", "primary")
+        carryover_color = "success" if carryover >= 0 else "danger"
+        metric_card("이월 잔액", f"₩{carryover:,.0f}", carryover_color)
     with c3:
-        metric_card("이번달 지출", f"₩{this_month_spent:,.0f}", "warning")
+        metric_card("사용가능 예산", f"₩{available_budget:,.0f}", "primary")
 
     c4, c5, c6 = st.columns(3)
     with c4:
-        metric_card("총 지출", f"₩{total_spent:,.0f}", "danger")
+        metric_card("이번달 지출", f"₩{this_month_spent:,.0f}", "warning")
     with c5:
-        metric_card("잔여 예산", f"₩{remaining:,.0f}", "success" if remaining > 0 else "danger")
+        metric_card("잔여 예산", f"₩{remaining:,.0f}", "success" if remaining >= 0 else "danger")
     with c6:
         metric_card("거래 건수", f"{tx_count}건", "warning")
+
+    # Show budget status message
+    if monthly_budget == 0:
+        st.warning(f"⚠️ {current_year}년 {current_month}월 예산이 설정되지 않았습니다. '예산 설정' 메뉴에서 예산을 설정해주세요.")
 
     if df.empty:
         st.info("아직 등록된 거래가 없습니다. '지출 입력' 메뉴에서 첫 거래를 등록하세요!")
@@ -688,37 +701,40 @@ if page == "📊 대시보드":
         col_left, col_right = st.columns(2)
 
         with col_left:
-            st.markdown('<p class="section-title">카테고리별 지출</p>', unsafe_allow_html=True)
+            st.markdown('<p class="section-title">카테고리별 지출 (이번달)</p>', unsafe_allow_html=True)
             if "Category" in df.columns:
-                cat_data = df.groupby("Category")["Amount"].sum().reset_index()
-                fig = px.pie(
-                    cat_data, values="Amount", names="Category",
-                    color_discrete_sequence=["#6C63FF", "#FF5252", "#00D2FF", "#00E676", "#FFD600", "#FF6E40", "#AB47BC", "#26C6DA"],
-                    hole=0.45,
-                )
-                fig.update_layout(
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#FAFAFA"),
-                    legend=dict(font=dict(size=12)),
-                    margin=dict(t=20, b=20, l=20, r=20),
-                )
-                st.plotly_chart(fig, config={"displayModeBar": False})
+                # Filter to this month only for the pie chart
+                this_month_df = df[(df["Date"].dt.month == current_month) & (df["Date"].dt.year == current_year)]
+                if not this_month_df.empty:
+                    cat_data = this_month_df.groupby("Category")["Amount"].sum().reset_index()
+                    fig = px.pie(
+                        cat_data, values="Amount", names="Category",
+                        color_discrete_sequence=["#6C63FF", "#FF5252", "#00D2FF", "#00E676", "#FFD600", "#FF6E40", "#AB47BC", "#26C6DA"],
+                        hole=0.45,
+                    )
+                    fig.update_layout(
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#FAFAFA"),
+                        legend=dict(font=dict(size=12)),
+                        margin=dict(t=20, b=20, l=20, r=20),
+                    )
+                    st.plotly_chart(fig, config={"displayModeBar": False})
+                else:
+                    st.info("이번 달 지출 내역이 없습니다.")
 
         with col_right:
-            st.markdown('<p class="section-title">예산 대비 지출 현황</p>', unsafe_allow_html=True)
+            st.markdown('<p class="section-title">예산 대비 지출 현황 (이번달)</p>', unsafe_allow_html=True)
             if not current_month_budgets.empty:
-                # Calculate this year's spending per category
-                this_year_df = df[df["Date"].dt.year == current_year] if not df.empty else df
-                cat_spent = this_year_df.groupby("Category")["Amount"].sum().reset_index() if not this_year_df.empty else pd.DataFrame(columns=["Category", "Amount"])
+                # This month's spending per category
+                this_month_df = df[(df["Date"].dt.month == current_month) & (df["Date"].dt.year == current_year)]
+                cat_spent = this_month_df.groupby("Category")["Amount"].sum().reset_index() if not this_month_df.empty else pd.DataFrame(columns=["Category", "Amount"])
 
-                # Calculate cumulative budget per category
+                # This month's budget per category
                 budget_by_cat = {}
-                for m in range(1, current_month + 1):
-                    month_budgets = get_budget_for_month(budgets, current_year, m)
-                    for _, row in month_budgets.iterrows():
-                        cat = row["Category"]
-                        budget_by_cat[cat] = budget_by_cat.get(cat, 0) + row["Monthly Budget"]
+                for _, row in current_month_budgets.iterrows():
+                    cat = row["Category"]
+                    budget_by_cat[cat] = budget_by_cat.get(cat, 0) + row["Monthly Budget"]
 
                 comparison = pd.DataFrame(list(budget_by_cat.items()), columns=["Category", "Budget"])
                 comparison = comparison.merge(cat_spent, on="Category", how="left").fillna(0)
@@ -1007,20 +1023,91 @@ elif page == "⚙️ 예산 설정":
     st.markdown('<p class="main-header">예산 설정</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">카테고리별 월/연간 예산을 설정합니다</p>', unsafe_allow_html=True)
 
+    # Force fresh data
+    st.cache_data.clear()
     budgets = load_budgets()
     month_names = {0: "전체 (연간)", 1: "1월", 2: "2월", 3: "3월", 4: "4월", 5: "5월",
                    6: "6월", 7: "7월", 8: "8월", 9: "9월", 10: "10월", 11: "11월", 12: "12월"}
 
+    now = datetime.datetime.now()
+    current_year = now.year
+    current_month = now.month
+
+    # ── Total Budget Summary ──
+    st.markdown('<p class="section-title">예산 요약</p>', unsafe_allow_html=True)
+
     if not budgets.empty:
-        st.markdown('<p class="section-title">현재 예산</p>', unsafe_allow_html=True)
-        display_b = budgets.copy()
-        display_b["Monthly Budget"] = display_b["Monthly Budget"].apply(lambda x: f"₩{x:,.0f}")
-        display_b["Month"] = display_b["Month"].apply(lambda x: month_names.get(x, str(x)))
-        display_b = display_b.rename(columns={"Monthly Budget": "예산", "Year": "연도", "Month": "월", "Category": "카테고리", "Notes": "메모"})
-        st.dataframe(display_b[["카테고리", "예산", "연도", "월", "메모"]], width="stretch", hide_index=True)
+        # Calculate this month's budget
+        this_month_budgets = get_budget_for_month(budgets, current_year, current_month)
+        this_month_total = this_month_budgets["Monthly Budget"].sum() if not this_month_budgets.empty else 0
+
+        # Calculate yearly total (all months)
+        yearly_total = 0
+        for m in range(1, 13):
+            m_budget = get_budget_for_month(budgets, current_year, m)
+            yearly_total += m_budget["Monthly Budget"].sum() if not m_budget.empty else 0
+
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            metric_card(f"{current_month}월 예산", f"₩{this_month_total:,.0f}", "primary")
+        with sc2:
+            metric_card(f"{current_year}년 총예산", f"₩{yearly_total:,.0f}", "primary")
+        with sc3:
+            cat_count = len(this_month_budgets["Category"].unique()) if not this_month_budgets.empty else 0
+            metric_card("카테고리 수", f"{cat_count}개", "warning")
+
+        # Category breakdown for this month
+        if not this_month_budgets.empty:
+            st.markdown(f"**{current_year}년 {current_month}월 카테고리별 예산:**")
+            cat_summary = this_month_budgets.groupby("Category")["Monthly Budget"].sum().reset_index()
+            cat_summary = cat_summary.rename(columns={"Category": "카테고리", "Monthly Budget": "예산"})
+            cat_summary["예산"] = cat_summary["예산"].apply(lambda x: f"₩{x:,.0f}")
+            st.dataframe(cat_summary, width="stretch", hide_index=True)
+        else:
+            st.warning(f"⚠️ {current_year}년 {current_month}월 예산이 설정되지 않았습니다. 아래에서 예산을 추가해주세요.")
+    else:
+        st.info("설정된 예산이 없습니다. 아래에서 예산을 추가해주세요.")
+
+    st.markdown("---")
+
+    # ── Current Budget List with Filters ──
+    if not budgets.empty:
+        st.markdown('<p class="section-title">현재 예산 목록</p>', unsafe_allow_html=True)
+
+        # Filters
+        filter_col1, filter_col2, filter_col3 = st.columns(3)
+        with filter_col1:
+            years_in_data = sorted(budgets["Year"].unique().tolist(), reverse=True)
+            filter_year = st.selectbox("연도 필터", ["전체"] + years_in_data, key="budget_filter_year")
+        with filter_col2:
+            filter_month = st.selectbox("월 필터", ["전체"] + list(month_names.keys()), format_func=lambda x: "전체" if x == "전체" else month_names[x], key="budget_filter_month")
+        with filter_col3:
+            cats_in_data = sorted(budgets["Category"].unique().tolist())
+            filter_cat = st.selectbox("카테고리 필터", ["전체"] + cats_in_data, key="budget_filter_cat")
+
+        # Apply filters
+        filtered_budgets = budgets.copy()
+        if filter_year != "전체":
+            filtered_budgets = filtered_budgets[filtered_budgets["Year"] == filter_year]
+        if filter_month != "전체":
+            filtered_budgets = filtered_budgets[filtered_budgets["Month"] == filter_month]
+        if filter_cat != "전체":
+            filtered_budgets = filtered_budgets[filtered_budgets["Category"] == filter_cat]
+
+        if not filtered_budgets.empty:
+            display_b = filtered_budgets.copy()
+            display_b["Monthly Budget"] = display_b["Monthly Budget"].apply(lambda x: f"₩{x:,.0f}")
+            display_b["Month"] = display_b["Month"].apply(lambda x: month_names.get(x, str(x)))
+            display_b = display_b.rename(columns={"Monthly Budget": "예산", "Year": "연도", "Month": "월", "Category": "카테고리", "Notes": "메모"})
+            st.dataframe(display_b[["카테고리", "예산", "연도", "월", "메모"]], width="stretch", hide_index=True)
+            st.caption(f"총 {len(filtered_budgets)}건")
+        else:
+            st.info("필터 조건에 맞는 예산이 없습니다.")
 
         # ── Edit existing budget ──
         st.markdown('<p class="section-title">예산 수정</p>', unsafe_allow_html=True)
+
+        # Use original budgets for editing (not filtered)
         edit_idx = st.selectbox(
             "수정할 항목 선택",
             range(len(budgets)),
@@ -1047,7 +1134,7 @@ elif page == "⚙️ 예산 설정":
 
             fc1, fc2 = st.columns(2)
             with fc1:
-                if st.form_submit_button("💾 수정 저장", width="stretch"):
+                if st.form_submit_button("💾 수정 저장", use_container_width=True):
                     ws = get_budget_sheet()
                     sheet_row = edit_idx + 2
                     ws.update(f"A{sheet_row}:E{sheet_row}", [[edit_cat, edit_budget, edit_year, edit_month, edit_notes]])
@@ -1055,7 +1142,7 @@ elif page == "⚙️ 예산 설정":
                     st.success(f"✅ '{edit_cat}' 예산이 수정되었습니다.")
                     st.rerun()
             with fc2:
-                if st.form_submit_button("🗑️ 삭제", width="stretch"):
+                if st.form_submit_button("🗑️ 삭제", use_container_width=True):
                     ws = get_budget_sheet()
                     sheet_row = edit_idx + 2
                     ws.delete_rows(sheet_row)
@@ -1076,15 +1163,15 @@ elif page == "⚙️ 예산 설정":
                 "월",
                 options=list(month_names.keys()),
                 format_func=lambda x: month_names[x],
-                index=0,  # default to "전체 (연간)"
+                index=current_month,  # default to current month
                 key="new_month_select"
             )
 
         notes = st.text_input("메모", placeholder="선택사항")
 
-        st.info("💡 월=0(전체)으로 설정하면 해당 연도 모든 달에 동일한 예산이 적용됩니다.")
+        st.info("💡 월=0(전체)으로 설정하면 해당 연도 모든 달에 동일한 예산이 적용됩니다. 특정 월만 설정하면 그 달에만 적용됩니다.")
 
-        if st.form_submit_button("➕ 예산 추가", width="stretch"):
+        if st.form_submit_button("➕ 예산 추가", use_container_width=True):
             if new_cat and new_budget > 0:
                 ws = get_budget_sheet()
                 ws.append_row([new_cat, new_budget, new_year, new_month, notes])
