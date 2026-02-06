@@ -689,83 +689,120 @@ if page == "📊 대시보드":
 
     if df.empty:
         st.info("아직 등록된 거래가 없습니다. '지출 입력' 메뉴에서 첫 거래를 등록하세요!")
-    else:
 
-        st.markdown("")
+    st.markdown("")
 
-        # Charts row
-        col_left, col_right = st.columns(2)
+    # Charts row
+    col_left, col_right = st.columns(2)
 
-        with col_left:
-            st.markdown('<p class="section-title">카테고리별 지출 (이번달)</p>', unsafe_allow_html=True)
-            if "Category" in df.columns:
-                # Filter to this month only for the pie chart
-                this_month_df = df[(df["Date"].dt.month == current_month) & (df["Date"].dt.year == current_year)]
-                if not this_month_df.empty:
-                    cat_data = this_month_df.groupby("Category")["Amount"].sum().reset_index()
-                    fig = px.pie(
-                        cat_data, values="Amount", names="Category",
-                        color_discrete_sequence=["#6C63FF", "#FF5252", "#00D2FF", "#00E676", "#FFD600", "#FF6E40", "#AB47BC", "#26C6DA"],
-                        hole=0.45,
-                    )
-                    fig.update_layout(
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        font=dict(color="#FAFAFA"),
-                        legend=dict(font=dict(size=12)),
-                        margin=dict(t=20, b=20, l=20, r=20),
-                    )
-                    st.plotly_chart(fig, config={"displayModeBar": False})
-                else:
-                    st.info("이번 달 지출 내역이 없습니다.")
+    # ── Chart 1: This Month's Budget vs Spending ──
+    with col_left:
+        st.markdown(f'<p class="section-title">{current_month}월 예산 대비 지출</p>', unsafe_allow_html=True)
 
-        with col_right:
-            st.markdown('<p class="section-title">예산 대비 지출 현황 (이번달)</p>', unsafe_allow_html=True)
-            if not current_month_budgets.empty:
-                # This month's spending per category
-                this_month_df = df[(df["Date"].dt.month == current_month) & (df["Date"].dt.year == current_year)]
-                cat_spent = this_month_df.groupby("Category")["Amount"].sum().reset_index() if not this_month_df.empty else pd.DataFrame(columns=["Category", "Amount"])
+        if monthly_budget > 0:
+            # Calculate percentage
+            spent_pct = min((this_month_spent / monthly_budget) * 100, 100) if monthly_budget > 0 else 0
+            remaining_pct = max(100 - spent_pct, 0)
+            over_amount = max(this_month_spent - monthly_budget, 0)
 
-                # This month's budget per category
-                budget_by_cat = {}
-                for _, row in current_month_budgets.iterrows():
-                    cat = row["Category"]
-                    budget_by_cat[cat] = budget_by_cat.get(cat, 0) + row["Monthly Budget"]
+            # Donut chart for this month
+            if over_amount > 0:
+                # Over budget - show spent and over
+                fig1 = go.Figure(data=[go.Pie(
+                    labels=["지출 (예산 내)", "초과"],
+                    values=[monthly_budget, over_amount],
+                    hole=0.6,
+                    marker_colors=["#FF5252", "#FF1744"],
+                    textinfo="label+percent",
+                    textfont=dict(color="#FAFAFA"),
+                )])
+                center_text = f"<b>초과</b><br>₩{over_amount:,.0f}"
+            else:
+                # Within budget - show spent and remaining
+                fig1 = go.Figure(data=[go.Pie(
+                    labels=["지출", "잔여"],
+                    values=[this_month_spent, monthly_budget - this_month_spent],
+                    hole=0.6,
+                    marker_colors=["#FF5252", "#00E676"],
+                    textinfo="label+percent",
+                    textfont=dict(color="#FAFAFA"),
+                )])
+                center_text = f"<b>{spent_pct:.0f}%</b><br>사용"
 
-                comparison = pd.DataFrame(list(budget_by_cat.items()), columns=["Category", "Budget"])
-                comparison = comparison.merge(cat_spent, on="Category", how="left").fillna(0)
-                comparison["Spent"] = comparison["Amount"]
-                comparison["Remaining"] = (comparison["Budget"] - comparison["Spent"]).clip(lower=0)
-                comparison["Over"] = (comparison["Spent"] - comparison["Budget"]).clip(lower=0)
+            fig1.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#FAFAFA"),
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5),
+                margin=dict(t=20, b=40, l=20, r=20),
+                annotations=[dict(text=center_text, x=0.5, y=0.5, font_size=16, showarrow=False, font_color="#FAFAFA")]
+            )
+            st.plotly_chart(fig1, config={"displayModeBar": False}, use_container_width=True)
+            st.caption(f"예산: ₩{monthly_budget:,.0f} | 지출: ₩{this_month_spent:,.0f} | 잔여: ₩{monthly_budget - this_month_spent:,.0f}")
+        else:
+            st.info(f"{current_month}월 예산이 설정되지 않았습니다.")
+            if this_month_spent > 0:
+                st.metric("이번달 지출", f"₩{this_month_spent:,.0f}")
+
+    # ── Chart 2: Year-to-Date Total Budget vs Total Spending ──
+    with col_right:
+        st.markdown(f'<p class="section-title">{current_year}년 총 예산 대비 총 지출</p>', unsafe_allow_html=True)
+
+        # Calculate year-to-date totals (only months 1 to current_month with budgets set)
+        ytd_budget = 0
+        ytd_spent = 0
+        monthly_data = []
+
+        for m in range(1, current_month + 1):
+            m_budget = get_budget_for_month(budgets, current_year, m)
+            m_budget_total = m_budget["Monthly Budget"].sum() if not m_budget.empty else 0
+
+            if not df.empty:
+                m_spent = df[(df["Date"].dt.month == m) & (df["Date"].dt.year == current_year)]["Amount"].sum()
+            else:
+                m_spent = 0
+
+            if m_budget_total > 0:  # Only count months with budget set
+                ytd_budget += m_budget_total
+                ytd_spent += m_spent
+                monthly_data.append({
+                    "월": f"{m}월",
+                    "예산": m_budget_total,
+                    "지출": m_spent
+                })
+
+        if ytd_budget > 0:
+            # Stacked bar chart showing budget vs spending by month
+            if monthly_data:
+                monthly_df = pd.DataFrame(monthly_data)
 
                 fig2 = go.Figure()
+
+                # Budget bars
+                fig2.add_trace(go.Bar(
+                    name="예산",
+                    x=monthly_df["월"],
+                    y=monthly_df["예산"],
+                    marker_color="#6C63FF",
+                    text=monthly_df["예산"].apply(lambda x: f"₩{x/10000:.0f}만"),
+                    textposition="outside",
+                    textfont=dict(color="#FAFAFA", size=10),
+                ))
+
+                # Spending bars
                 fig2.add_trace(go.Bar(
                     name="지출",
-                    x=comparison["Category"],
-                    y=comparison["Spent"] - comparison["Over"],
+                    x=monthly_df["월"],
+                    y=monthly_df["지출"],
                     marker_color="#FF5252",
-                    text=comparison["Spent"].apply(lambda x: f"₩{x:,.0f}"),
-                    textposition="inside",
-                    textfont=dict(color="#FAFAFA"),
+                    text=monthly_df["지출"].apply(lambda x: f"₩{x/10000:.0f}만"),
+                    textposition="outside",
+                    textfont=dict(color="#FAFAFA", size=10),
                 ))
-                fig2.add_trace(go.Bar(
-                    name="초과",
-                    x=comparison["Category"],
-                    y=comparison["Over"],
-                    marker_color="#FF1744",
-                    textfont=dict(color="#FAFAFA"),
-                ))
-                fig2.add_trace(go.Bar(
-                    name="잔여",
-                    x=comparison["Category"],
-                    y=comparison["Remaining"],
-                    marker_color="#8B83FF",
-                    text=comparison["Remaining"].apply(lambda x: f"₩{x:,.0f}"),
-                    textposition="inside",
-                    textfont=dict(color="#FAFAFA"),
-                ))
+
                 fig2.update_layout(
-                    barmode="stack",
+                    barmode="group",
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(color="#FAFAFA"),
@@ -774,7 +811,14 @@ if page == "📊 대시보드":
                     margin=dict(t=30, b=20, l=20, r=20),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
-                st.plotly_chart(fig2, config={"displayModeBar": False})
+                st.plotly_chart(fig2, config={"displayModeBar": False}, use_container_width=True)
+
+            # Summary
+            remaining_ytd = ytd_budget - ytd_spent
+            usage_pct = (ytd_spent / ytd_budget * 100) if ytd_budget > 0 else 0
+            st.caption(f"총 예산: ₩{ytd_budget:,.0f} | 총 지출: ₩{ytd_spent:,.0f} | 잔여: ₩{remaining_ytd:,.0f} ({usage_pct:.1f}% 사용)")
+        else:
+            st.info("설정된 예산이 없습니다.")
 
 
 # ──────────────────────────────────────────────
@@ -1047,6 +1091,20 @@ elif page == "⚙️ 예산 설정":
         return df.reset_index(drop=True)
 
     budgets = load_budgets_fresh()
+
+    # ── Data Migration: Fix Month=0 entries ──
+    month0_entries = budgets[budgets["Month"] == 0]
+    if not month0_entries.empty:
+        st.error(f"⚠️ 월이 미지정(0)인 항목이 {len(month0_entries)}건 있습니다. 예산이 제대로 집계되지 않습니다.")
+        if st.button("🔧 1월 예산으로 자동 변환", key="migrate_btn"):
+            ws = get_budget_sheet()
+            for idx, row in month0_entries.iterrows():
+                sheet_row = idx + 2  # header row + 0-based index
+                # Update Month column (D) to 1
+                ws.update(f"D{sheet_row}", [[1]])
+            st.cache_data.clear()
+            st.success(f"✅ {len(month0_entries)}건의 예산이 1월로 변환되었습니다.")
+            st.rerun()
 
     # ── Total Budget Summary ──
     st.markdown('<p class="section-title">예산 요약</p>', unsafe_allow_html=True)
