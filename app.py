@@ -406,7 +406,14 @@ def load_budgets() -> pd.DataFrame:
     df = pd.DataFrame(data)
     df["Monthly Budget"] = pd.to_numeric(df["Monthly Budget"], errors="coerce").fillna(0)
     df["Year"] = pd.to_numeric(df["Year"], errors="coerce").fillna(0).astype(int)
-    df["Month"] = pd.to_numeric(df["Month"], errors="coerce").fillna(0).astype(int)
+    # Handle legacy data without Month column
+    if "Month" not in df.columns:
+        df["Month"] = 0  # Default to annual budget (applies to all months)
+    else:
+        df["Month"] = pd.to_numeric(df["Month"], errors="coerce").fillna(0).astype(int)
+    # Ensure Notes column exists
+    if "Notes" not in df.columns:
+        df["Notes"] = ""
     return df
 
 
