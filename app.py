@@ -429,10 +429,7 @@ def get_budget_for_month(budgets: pd.DataFrame, year: int, month: int) -> pd.Dat
     if monthly.empty:
         monthly = budgets[(budgets["Year"] == year) & (budgets["Month"] == 0)]
 
-    # If still empty, try just the year
-    if monthly.empty:
-        monthly = budgets[budgets["Year"] == year]
-
+    # Return empty if no budget is set for this month (don't fallback to random year data)
     return monthly
 
 
@@ -884,9 +881,15 @@ elif page == "📤 지출 입력":
 # ──────────────────────────────────────────────
 elif page == "📋 거래 내역":
     st.markdown('<p class="main-header">거래 내역</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">전체 지출 기록을 조회합니다</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">전체 지출 기록을 조회 및 수정합니다</p>', unsafe_allow_html=True)
 
     df = load_transactions()
+    budgets = load_budgets()
+
+    # Get categories from budget settings
+    budget_categories = budgets["Category"].tolist() if not budgets.empty else []
+    default_categories = ["악기/장비", "음향장비", "악보/교재", "식비/간식", "교통비", "기타"]
+    all_categories = list(set(budget_categories + default_categories))
 
     if df.empty:
         st.info("등록된 거래가 없습니다.")
@@ -933,6 +936,68 @@ elif page == "📋 거래 내역":
             width="stretch",
             hide_index=True,
         )
+
+        # ── Transaction Edit Section ──
+        st.markdown('<p class="section-title">거래 수정</p>', unsafe_allow_html=True)
+        st.info("💡 투명한 예산 관리를 위해 **금액은 수정할 수 없습니다**. 카테고리, 설명, 결제수단만 수정 가능합니다.")
+
+        # Create a display string for each transaction
+        df_with_idx = df.reset_index(drop=True)
+        tx_options = []
+        for i, row in df_with_idx.iterrows():
+            date_str = row["Date"].strftime("%Y-%m-%d") if pd.notna(row["Date"]) else "날짜없음"
+            amount_str = f"₩{row['Amount']:,.0f}"
+            tx_options.append(f"{i}: [{date_str}] {row['Category']} - {row['Description'][:20]}... ({amount_str})")
+
+        if tx_options:
+            selected_tx = st.selectbox(
+                "수정할 거래 선택",
+                range(len(df_with_idx)),
+                format_func=lambda i: tx_options[i],
+                key="tx_edit_select"
+            )
+
+            sel_row = df_with_idx.iloc[selected_tx]
+
+            with st.form("edit_transaction_form"):
+                st.markdown(f"**선택된 거래 금액: ₩{sel_row['Amount']:,.0f}** (수정 불가)")
+
+                etc1, etc2 = st.columns(2)
+                with etc1:
+                    # Category edit - combine existing categories with budget categories
+                    existing_cats = df["Category"].unique().tolist()
+                    combined_cats = sorted(list(set(existing_cats + all_categories)))
+                    current_cat_idx = combined_cats.index(sel_row["Category"]) if sel_row["Category"] in combined_cats else 0
+                    edit_category = st.selectbox("카테고리", combined_cats, index=current_cat_idx)
+                    edit_description = st.text_input("설명", value=str(sel_row.get("Description", "")))
+                with etc2:
+                    payment_methods = ["카드", "현금", "계좌이체", "기타"]
+                    current_pm = sel_row.get("Payment Method", "카드")
+                    pm_idx = payment_methods.index(current_pm) if current_pm in payment_methods else 0
+                    edit_payment = st.selectbox("결제수단", payment_methods, index=pm_idx)
+                    edit_submitted_by = st.text_input("입력자", value=str(sel_row.get("Submitted By", "")))
+
+                tfc1, tfc2 = st.columns(2)
+                with tfc1:
+                    if st.form_submit_button("💾 수정 저장", use_container_width=True):
+                        ws = get_sheet()
+                        sheet_row = selected_tx + 2  # +1 for header, +1 for 0-index
+                        # Update only Category, Description, Payment Method, Submitted By (columns B, C, E, H)
+                        ws.update(f"B{sheet_row}", [[edit_category]])
+                        ws.update(f"C{sheet_row}", [[edit_description]])
+                        ws.update(f"E{sheet_row}", [[edit_payment]])
+                        ws.update(f"H{sheet_row}", [[edit_submitted_by]])
+                        st.cache_data.clear()
+                        st.success(f"✅ 거래가 수정되었습니다.")
+                        st.rerun()
+                with tfc2:
+                    if st.form_submit_button("🗑️ 삭제", use_container_width=True):
+                        ws = get_sheet()
+                        sheet_row = selected_tx + 2
+                        ws.delete_rows(sheet_row)
+                        st.cache_data.clear()
+                        st.success("✅ 거래가 삭제되었습니다.")
+                        st.rerun()
 
 
 # ──────────────────────────────────────────────
