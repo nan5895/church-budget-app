@@ -1019,9 +1019,6 @@ elif page == "⚙️ 예산 설정":
     st.markdown('<p class="main-header">예산 설정</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">카테고리별 월 예산을 설정합니다 (각 월별로 설정 필요)</p>', unsafe_allow_html=True)
 
-    # Force fresh data
-    st.cache_data.clear()
-    budgets = load_budgets()
     # Month 1-12 only (no Month=0 "annual" option - each month must be set explicitly)
     month_names = {1: "1월", 2: "2월", 3: "3월", 4: "4월", 5: "5월",
                    6: "6월", 7: "7월", 8: "8월", 9: "9월", 10: "10월", 11: "11월", 12: "12월"}
@@ -1032,19 +1029,36 @@ elif page == "⚙️ 예산 설정":
     current_year = now.year
     current_month = now.month
 
+    # Load fresh data directly from Google Sheet (bypass cache)
+    def load_budgets_fresh():
+        ws = get_budget_sheet()
+        data = ws.get_all_records()
+        if not data:
+            return pd.DataFrame(columns=["Category", "Monthly Budget", "Year", "Month", "Notes"])
+        df = pd.DataFrame(data)
+        df["Monthly Budget"] = pd.to_numeric(df["Monthly Budget"], errors="coerce").fillna(0)
+        df["Year"] = pd.to_numeric(df["Year"], errors="coerce").fillna(0).astype(int)
+        if "Month" not in df.columns:
+            df["Month"] = 0
+        else:
+            df["Month"] = pd.to_numeric(df["Month"], errors="coerce").fillna(0).astype(int)
+        if "Notes" not in df.columns:
+            df["Notes"] = ""
+        return df.reset_index(drop=True)
+
+    budgets = load_budgets_fresh()
+
     # ── Total Budget Summary ──
     st.markdown('<p class="section-title">예산 요약</p>', unsafe_allow_html=True)
 
     if not budgets.empty:
         # Calculate this month's budget
-        this_month_budgets = get_budget_for_month(budgets, current_year, current_month)
+        this_month_budgets = budgets[(budgets["Year"] == current_year) & (budgets["Month"] == current_month)]
         this_month_total = this_month_budgets["Monthly Budget"].sum() if not this_month_budgets.empty else 0
 
-        # Calculate yearly total (all months)
-        yearly_total = 0
-        for m in range(1, 13):
-            m_budget = get_budget_for_month(budgets, current_year, m)
-            yearly_total += m_budget["Monthly Budget"].sum() if not m_budget.empty else 0
+        # Calculate yearly total (only explicitly set months)
+        yearly_budgets = budgets[(budgets["Year"] == current_year) & (budgets["Month"] >= 1) & (budgets["Month"] <= 12)]
+        yearly_total = yearly_budgets["Monthly Budget"].sum() if not yearly_budgets.empty else 0
 
         sc1, sc2, sc3 = st.columns(3)
         with sc1:
@@ -1084,7 +1098,7 @@ elif page == "⚙️ 예산 설정":
             cats_in_data = sorted(budgets["Category"].unique().tolist())
             filter_cat = st.selectbox("카테고리 필터", ["전체"] + cats_in_data, key="budget_filter_cat")
 
-        # Apply filters
+        # Apply filters for display only
         filtered_budgets = budgets.copy()
         if filter_year != "전체":
             filtered_budgets = filtered_budgets[filtered_budgets["Year"] == filter_year]
@@ -1102,7 +1116,7 @@ elif page == "⚙️ 예산 설정":
             st.caption(f"총 {len(filtered_budgets)}건")
 
             # Warning for Month=0 entries
-            old_entries = filtered_budgets[filtered_budgets["Month"] == 0]
+            old_entries = budgets[budgets["Month"] == 0]
             if not old_entries.empty:
                 st.warning(f"⚠️ '미지정(월=0)' 항목이 {len(old_entries)}건 있습니다. 이 항목들은 예산에 반영되지 않습니다. 아래 '예산 수정'에서 올바른 월(1-12)로 수정해주세요.")
         else:
@@ -1111,27 +1125,36 @@ elif page == "⚙️ 예산 설정":
         # ── Edit existing budget ──
         st.markdown('<p class="section-title">예산 수정</p>', unsafe_allow_html=True)
 
-        # Use original budgets for editing (not filtered)
-        edit_idx = st.selectbox(
+        # Create selection options with row index stored
+        budget_options = []
+        for idx, row in budgets.iterrows():
+            label = f"{row['Category']} ({row['Year']}년 {month_names_display.get(row['Month'], '?')})"
+            budget_options.append((idx, label, row))
+
+        selected_option = st.selectbox(
             "수정할 항목 선택",
-            range(len(budgets)),
-            format_func=lambda i: f"{budgets.iloc[i]['Category']} ({budgets.iloc[i]['Year']}년 {month_names_display.get(budgets.iloc[i]['Month'], '?')})",
+            range(len(budget_options)),
+            format_func=lambda i: budget_options[i][1],
             key="edit_select",
         )
-        sel = budgets.iloc[edit_idx]
+
+        edit_idx, _, sel = budget_options[selected_option]
 
         # Check if current entry has Month=0 (needs fixing)
-        current_month_val = int(sel.get("Month", 0))
+        current_month_val = int(sel["Month"])
         if current_month_val == 0:
             st.error(f"⚠️ 이 항목은 월이 '미지정(0)'입니다. 아래에서 올바른 월(1-12)을 선택해주세요.")
 
-        with st.form("edit_budget_form"):
+        # Display current values
+        st.markdown(f"**현재 값:** {sel['Category']} | ₩{sel['Monthly Budget']:,.0f} | {sel['Year']}년 {month_names_display.get(current_month_val, '?')}")
+
+        with st.form("edit_budget_form", clear_on_submit=False):
             ec1, ec2 = st.columns(2)
             with ec1:
-                edit_cat = st.text_input("카테고리", value=sel["Category"])
-                edit_budget = st.number_input("예산 (원)", value=int(sel["Monthly Budget"]), min_value=0, step=10000)
+                edit_cat = st.text_input("카테고리", value=str(sel["Category"]), key="edit_cat")
+                edit_budget = st.number_input("예산 (원)", value=int(sel["Monthly Budget"]), min_value=0, step=10000, key="edit_budget")
             with ec2:
-                edit_year = st.number_input("연도", value=int(sel.get("Year", datetime.date.today().year)), min_value=2020, max_value=2100)
+                edit_year = st.number_input("연도", value=int(sel["Year"]), min_value=2020, max_value=2100, key="edit_year")
                 # Only allow months 1-12
                 month_options = list(month_names.keys())  # [1, 2, ..., 12]
                 # If current month is 0, default to current month
@@ -1140,9 +1163,10 @@ elif page == "⚙️ 예산 설정":
                     "월 (1-12월 선택)",
                     options=month_options,
                     format_func=lambda x: month_names[x],
-                    index=month_options.index(default_month)
+                    index=month_options.index(default_month),
+                    key="edit_month"
                 )
-            edit_notes = st.text_input("메모", value=str(sel.get("Notes", "")))
+            edit_notes = st.text_input("메모", value=str(sel.get("Notes", "") or ""), key="edit_notes")
 
             st.info("💡 각 월의 예산은 해당 월에만 적용됩니다. 여러 달에 같은 예산을 적용하려면 각 월별로 추가해주세요.")
 
@@ -1150,10 +1174,11 @@ elif page == "⚙️ 예산 설정":
             with fc1:
                 if st.form_submit_button("💾 수정 저장", use_container_width=True):
                     ws = get_budget_sheet()
+                    # Google Sheet row = DataFrame index + 2 (1 for header, 1 for 0-based index)
                     sheet_row = edit_idx + 2
                     ws.update(f"A{sheet_row}:E{sheet_row}", [[edit_cat, edit_budget, edit_year, edit_month, edit_notes]])
                     st.cache_data.clear()
-                    st.success(f"✅ '{edit_cat}' 예산이 수정되었습니다.")
+                    st.success(f"✅ '{edit_cat}' 예산이 수정되었습니다. ({edit_year}년 {month_names[edit_month]})")
                     st.rerun()
             with fc2:
                 if st.form_submit_button("🗑️ 삭제", use_container_width=True):
@@ -1166,13 +1191,13 @@ elif page == "⚙️ 예산 설정":
 
     st.markdown('<p class="section-title">예산 추가</p>', unsafe_allow_html=True)
 
-    with st.form("budget_form"):
+    with st.form("budget_form", clear_on_submit=True):
         bc1, bc2 = st.columns(2)
         with bc1:
             new_cat = st.text_input("카테고리명", placeholder="예: 악기/장비")
-            new_budget = st.number_input("예산 (원)", min_value=0, step=10000)
+            new_budget = st.number_input("예산 (원)", min_value=0, step=10000, key="new_budget")
         with bc2:
-            new_year = st.number_input("연도", value=datetime.date.today().year, min_value=2020, max_value=2100)
+            new_year = st.number_input("연도", value=datetime.date.today().year, min_value=2020, max_value=2100, key="new_year")
             add_month_options = list(month_names.keys())  # [1, 2, ..., 12]
             new_month = st.selectbox(
                 "월 (1-12월 선택)",
@@ -1182,7 +1207,7 @@ elif page == "⚙️ 예산 설정":
                 key="new_month_select"
             )
 
-        notes = st.text_input("메모", placeholder="선택사항")
+        notes = st.text_input("메모", placeholder="선택사항", key="new_notes")
 
         st.info("💡 각 월의 예산은 해당 월에만 적용됩니다. 여러 달에 같은 예산이 필요하면 각 월별로 추가해주세요.")
 
@@ -1204,6 +1229,8 @@ elif page == "📥 리포트 다운로드":
     st.markdown('<p class="main-header">리포트 다운로드</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">예산 및 지출 현황을 포함한 상세 리포트를 다운로드합니다</p>', unsafe_allow_html=True)
 
+    # Force fresh data
+    st.cache_data.clear()
     df = load_transactions()
     budgets = load_budgets()
 
